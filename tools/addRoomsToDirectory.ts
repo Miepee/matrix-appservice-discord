@@ -1,102 +1,104 @@
-/* tslint:disable:no-console */
+/*
+Copyright 2018 matrix-appservice-discord
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+/* eslint-disable no-console */
 /**
  * Allows you to become an admin for a room the bot is in control of.
  */
 
-import { AppServiceRegistration, ClientFactory, Bridge } from "matrix-appservice-bridge";
-import * as yaml from "js-yaml";
-import * as fs from "fs";
 import * as args from "command-line-args";
 import * as usage from "command-line-usage";
-import * as log from "npmlog";
-import { DiscordBridgeConfig } from "../src/config";
-
+import { Log } from "../src/log";
+import { Util } from "../src/util";
+import { ToolsHelper } from "./toolshelper";
+const log = new Log("AddRoomsToDirectory");
 const optionDefinitions = [
     {
-        name: "help",
         alias: "h",
-        type: Boolean,
         description: "Display this usage guide.",
+        name: "help",
+        type: Boolean,
     },
     {
-      name: "config",
-      alias: "c",
-      type: String,
-      defaultValue: "config.yaml",
-      description: "The AS config file.",
-      typeLabel: "<config.yaml>",
-    },
-    {
-        name: "store",
-        alias: "s",
+        alias: "c",
+        defaultValue: "config.yaml",
+        description: "The AS config file.",
+        name: "config",
         type: String,
-        defaultValue: "room-store.db",
-        description: "The location of the room store.",
+        typeLabel: "<config.yaml>",
+    },
+    {
+        alias: "r",
+        defaultValue: "discord-registration.yaml",
+        description: "The AS registration file.",
+        name: "registration",
+        type: String,
+        typeLabel: "<discord-registration.yaml>",
     },
 ];
 
 const options = args(optionDefinitions);
 
 if (options.help) {
-    /* tslint:disable:no-console */
+    /* eslint-disable no-console */
     console.log(usage([
-    {
-        header: "Add rooms to directory",
-        content: "A tool to set all the bridged rooms to visible in the directory."},
-    {
-        header: "Options",
-        optionList: optionDefinitions,
-    },
+        {
+            content: "A tool to set all the bridged rooms to visible in the directory.",
+            header: "Add rooms to directory",
+        },
+        {
+            header: "Options",
+            optionList: optionDefinitions,
+        },
     ]));
     process.exit(0);
 }
-const yamlConfig = yaml.safeLoad(fs.readFileSync("./discord-registration.yaml", "utf8"));
-const registration = AppServiceRegistration.fromObject(yamlConfig);
-const config: DiscordBridgeConfig = yaml.safeLoad(fs.readFileSync(options.config, "utf8")) as DiscordBridgeConfig;
 
-if (registration === null) {
-    throw new Error("Failed to parse registration file");
+const {store, appservice} = ToolsHelper.getToolDependencies(options.config, options.registration, true);
+
+async function run(): Promise<void> {
+    try {
+        await store!.init();
+    } catch (e) {
+        log.error(`Failed to load database`, e);
+    }
+    let rooms = await store!.roomStore.getEntriesByRemoteRoomData({
+        /* eslint-disable @typescript-eslint/naming-convention */
+        discord_type: "text",
+        /* eslint-disable @typescript-eslint/naming-convention */
+    });
+    rooms = rooms.filter((r) => r.remote && r.remote.get("plumbed") !== true );
+    log.info(`Got ${rooms.length} rooms to set`);
+    try {
+        await Util.AsyncForEach(rooms, async (room) => {
+            const guild = room.remote!.get("discord_guild");
+            const roomId = room.matrix!.getId();
+            try {
+                await appservice.botIntent.underlyingClient.setDirectoryVisibility(
+                    roomId,
+                    "public",
+                );
+                log.info(`Set ${roomId} to visible in ${guild}'s directory`);
+            } catch (e) {
+                log.error(`Failed to set ${roomId} to visible in ${guild}'s directory`, e);
+            }
+        });
+    } catch (e) {
+        log.error(`Failed to run script`, e);
+    }
 }
 
-const clientFactory = new ClientFactory({
-    appServiceUserId: "@" + registration.sender_localpart + ":" + config.bridge.domain,
-    token: registration.as_token,
-    url: config.bridge.homeserverUrl,
-});
-
-const bridge = new Bridge({
-    homeserverUrl: true,
-    registration: true,
-    domain: "rubbish",
-    controller: {
-        onEvent: () => { },
-    },
-    roomStore: options.store,
-});
-
-bridge.loadDatabases().catch((e) => {
-    log.error("AddRoom", `Failed to load database`, e);
-}).then(() => {
-    return bridge.getRoomStore().getEntriesByRemoteRoomData({
-        discord_type: "text",
-    });
-}).then((rooms) => {
-    rooms = rooms.filter((r) => r.remote.get("plumbed") !== true );
-    const client = clientFactory.getClientAs();
-    log.info("AddRoom", `Got ${rooms.length} rooms to set`);
-    rooms.forEach((room) => {
-        const guild = room.remote.get("discord_guild");
-        const roomId = room.matrix.getId();
-        client.setRoomDirectoryVisibilityAppService(
-            guild,
-            roomId,
-            "public",
-        ).then(() => {
-            log.info("AddRoom", `Set ${roomId} to visible in ${guild}'s directory`);
-        }).catch((e) => {
-            log.error("AddRoom", `Failed to set ${roomId} to visible in ${guild}'s directory`, e);
-        });
-    });
-}).catch((e) => {
-    log.error("AddRoom", `Failed to run script`, e);
-});
+run(); // tslint:disable-line no-floating-promises

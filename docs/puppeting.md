@@ -13,8 +13,8 @@ has the benefits of (not all of these may be implemented):
 Discord is currently __not__ offering any way to authenticate on behalf
 of a user _and_ interact on their behalf. The OAuth system does not allow
 remote access beyond reading information about the users. While [developers have
-expressed a wish for this](https://feedback.discordapp.com/forums/326712-discord-dream-land/suggestions/16753837-support-custom-clients)
-,it is my opinion that Discord are unlikely to support this any time soon. With
+expressed a wish for this](https://feedback.discordapp.com/forums/326712-discord-dream-land/suggestions/16753837-support-custom-clients),
+it is my opinion that Discord are unlikely to support this any time soon. With
 all this said, Discord will not be banning users or the bridge itself for acting
 on the behalf of the user.
 
@@ -32,19 +32,12 @@ their system. They have never given official support on custom clients (and
   bot which is within the rules.
 
 ## How to Puppet an Account
-*2FA does not work with bridging, please do not try it.*
+~~*2FA does not work with bridging, please do not try it.*~~
+You should be able to puppet with 2FA enabled on your account
 
-* Go to [Discord](https://discordapp.com/channels/@me) on your *browser* and log
-  in if you haven't.
-* Open the developer console (On Firefox/Chrome this is Shift+Control+C)
-* Click Storage or Application if it is not already selected.
-* On the left hand side there will be an option for "Local Storage", find this
-  and expand it and then click on the Discord option.
-* Find the option for token on the right hand side and copy the value, excluding
-  the `"`s
-* ~~Start a conversation with ``@_discord_bot:yourdomain`` on Matrix and send
-  the message "account.link Your_Token"~~
-* ~~The bridge should reply once it's managed to log you in.~~
-* Bot control has not been implemented yet, for now you will need to edit the
-  database and fill in user_tokens with your userId and token.
-* Congratulations, you are now puppeted.
+*You must also be a bridge admin to add or remove puppets at the moment*
+
+* Follow https://discordhelp.net/discord-token to find your discord token.
+* Stop the bridge, if it is running.
+* Run `npm run usertool -- --add` and follow the instructions.
+* If all is well, you can start the bridge.

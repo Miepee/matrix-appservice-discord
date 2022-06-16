@@ -1,289 +1,361 @@
-import * as SQLite3 from "sqlite3";
-import * as log from "npmlog";
-import * as Bluebird from "bluebird";
+/*
+Copyright 2017 - 2019 matrix-appservice-discord
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 import * as fs from "fs";
 import { IDbSchema } from "./db/schema/dbschema";
 import { IDbData} from "./db/dbdatainterface";
-const CURRENT_SCHEMA = 7;
+import { SQLite3 } from "./db/sqlite3";
+import { Log } from "./log";
+import { DiscordBridgeConfigDatabase } from "./config";
+import { Postgres } from "./db/postgres";
+import { IDatabaseConnector } from "./db/connector";
+import { DbRoomStore } from "./db/roomstore";
+import { DbUserStore } from "./db/userstore";
+import { IAppserviceStorageProvider } from "matrix-bot-sdk";
+import { UserActivitySet, UserActivity } from "matrix-appservice-bridge";
+const log = new Log("DiscordStore");
+export const CURRENT_SCHEMA = 12;
 /**
  * Stores data for specific users and data not specific to rooms.
  */
-export class DiscordStore {
-  /**
-   * @param  {string} filepath Location of the SQLite database file.
-   */
-  public db: any;
-  private version: number;
-  private filepath: string;
-  constructor (filepath: string) {
-    this.version = null;
-    this.filepath = filepath;
-  }
+export class DiscordStore implements IAppserviceStorageProvider {
+    public db: IDatabaseConnector;
+    private config: DiscordBridgeConfigDatabase;
+    private pRoomStore: DbRoomStore;
+    private pUserStore: DbUserStore;
 
-  public backup_database(): Promise<void|{}> {
-    if (this.filepath === ":memory:") {
-      log.info("DiscordStore", "Can't backup a :memory: database.");
-      return Promise.resolve();
-    }
-    const BACKUP_NAME = this.filepath + ".backup";
+    private registeredUsers: Set<string>;
+    private asTxns: Set<string>;
 
-    return new Promise((resolve, reject) => {
-      // Check to see if a backup file already exists.
-      fs.access(BACKUP_NAME, (err) => {
-        return resolve(err === null);
-      });
-    }).then((result) => {
-      return new Promise((resolve, reject) => {
-        if (!result) {
-          log.warn("DiscordStore", "NOT backing up database while a file already exists");
-          resolve(true);
+    constructor(configOrFile: DiscordBridgeConfigDatabase|string) {
+        if (typeof(configOrFile) === "string") {
+            this.config = new DiscordBridgeConfigDatabase();
+            this.config.filename = configOrFile;
+        } else {
+            this.config = configOrFile;
         }
-        const rd = fs.createReadStream(this.filepath);
-        rd.on("error", reject);
-        const wr = fs.createWriteStream(BACKUP_NAME);
-        wr.on("error", reject);
-        wr.on("close", resolve);
-        rd.pipe(wr);
-      });
-    });
-  }
+        this.registeredUsers = new Set();
+        this.asTxns = new Set();
+    }
 
-  /**
-   * Checks the database has all the tables needed.
-   */
-  public async init (overrideSchema: number = 0): Promise<void> {
-    log.info("DiscordStore", "Starting DB Init");
-    await this.open_database();
-    let version = await this.getSchemaVersion();
-    const targetSchema = overrideSchema || CURRENT_SCHEMA;
-    while (version < targetSchema) {
-      version++;
-      const schemaClass = require(`./db/schema/v${version}.js`).Schema;
-      const schema = (new schemaClass() as IDbSchema);
-      log.info("DiscordStore", `Updating database to v${version}, "${schema.description}"`);
-      try {
-        await schema.run(this);
-        log.info("DiscordStore", "Updated database to version %s", version);
-      } catch (ex) {
-        log.error("DiscordStore", "Couldn't update database to schema %s", version);
-        log.error("DiscordStore", ex);
-        log.info("DiscordStore", "Rolling back to version %s", version - 1);
+    get roomStore() {
+        return this.pRoomStore;
+    }
+
+    get userStore() {
+        return this.pUserStore;
+    }
+
+    public async backupDatabase(): Promise<void|{}> {
+        if (this.config.filename == null) {
+            log.warn("Backups not supported on non-sqlite connector");
+            return;
+        }
+        if (this.config.filename === ":memory:") {
+            log.info("Can't backup a :memory: database.");
+            return;
+        }
+        const BACKUP_NAME = this.config.filename + ".backup";
+
+        return new Promise((resolve) => {
+            // Check to see if a backup file already exists.
+            fs.access(BACKUP_NAME, (err) => {
+                return resolve(err === null);
+            });
+        }).then(async (result) => {
+            return new Promise<void|{}>((resolve, reject) => {
+                if (!result) {
+                    log.warn("NOT backing up database while a file already exists");
+                    resolve(true);
+                }
+                const rd = fs.createReadStream(this.config.filename);
+                rd.on("error", reject);
+                const wr = fs.createWriteStream(BACKUP_NAME);
+                wr.on("error", reject);
+                wr.on("close", resolve);
+                rd.pipe(wr);
+            });
+        });
+    }
+
+    /**
+     * Checks the database has all the tables needed.
+     */
+    public async init(
+        overrideSchema: number = 0,
+    ): Promise<void> {
+        log.info("Starting DB Init");
+        await this.openDatabase();
+        let version = await this.getSchemaVersion();
+        const targetSchema = overrideSchema || CURRENT_SCHEMA;
+        log.info(`Database schema version is ${version}, latest version is ${targetSchema}`);
+        while (version < targetSchema) {
+            version++;
+            const schemaClass = require(`./db/schema/v${version}`).Schema;
+            let schema: IDbSchema;
+            schema = (new schemaClass() as IDbSchema);
+            log.info(`Updating database to v${version}, "${schema.description}"`);
+            try {
+                await schema.run(this);
+                log.info("Updated database to version ", version);
+            } catch (ex) {
+                log.error("Couldn't update database to schema ", version);
+                log.error(ex);
+                log.info("Rolling back to version ", version - 1);
+                try {
+                    await schema.rollBack(this);
+                } catch (ex) {
+                    log.error(ex);
+                    throw Error("Failure to update to latest schema. And failed to rollback.");
+                }
+                throw Error("Failure to update to latest schema.");
+            }
+            await this.setSchemaVersion(version);
+        }
+        log.info("Updated database to the latest schema");
+        // We need to prepopulate some sets
+        for (const row of await this.db.All("SELECT * FROM registered_users")) {
+            this.registeredUsers.add(row.user_id as string);
+        }
+
+        for (const row of await this.db.All("SELECT * FROM as_txns")) {
+            this.asTxns.add(row.txn_id as string);
+        }
+    }
+
+    public async close() {
+        await this.db.Close();
+    }
+
+    public async createTable(statement: string, tablename: string): Promise<void|Error> {
         try {
-          await schema.rollBack(this);
-        } catch (ex) {
-          log.error("DiscordStore", ex);
-          throw Error("Failure to update to latest schema. And failed to rollback.");
+            await this.db.Exec(statement);
+            log.info("Created table", tablename);
+        } catch (err) {
+            throw new Error(`Error creating '${tablename}': ${err}`);
         }
-        throw Error("Failure to update to latest schema.");
-      }
-      this.version = version;
-      await this.setSchemaVersion(version);
     }
-    log.info("DiscordStore", "Updated database to the latest schema");
-  }
 
-  public close () {
-    this.db.close();
-  }
-
-  public create_table (statement: string, tablename: string): Promise<null|Error> {
-    return this.db.runAsync(statement).then(() => {
-      log.info("DiscordStore", "Created table", tablename);
-    }).catch((err) => {
-      throw new Error(`Error creating '${tablename}': ${err}`);
-    });
-  }
-
-  public add_user_token(userId: string, discordId: string, token: string): Promise<any> {
-    log.silly("SQL", "add_user_token => %s", userId);
-    return Promise.all([
-        this.db.runAsync(
-          `
-          INSERT INTO user_id_discord_id (discord_id,user_id) VALUES ($discordId,$userId);
-          `
-        , {
-            $userId: userId,
-            $discordId: discordId,
-        }),
-        this.db.runAsync(
-          `
-          INSERT INTO discord_id_token (discord_id,token) VALUES ($discordId,$token);
-          `
-        , {
-            $discordId: discordId,
-            $token: token,
-        }),
-    ]).catch( (err) => {
-      log.error("DiscordStore", "Error storing user token %s", err);
-      throw err;
-    });
-  }
-
-  public delete_user_token(discordId: string): Promise<null> {
-    log.silly("SQL", "delete_user_token => %s", discordId);
-    return this.db.runAsync(
-      `
-      DELETE FROM user_id_discord_id WHERE discord_id = $id;
-      DELETE FROM discord_id_token WHERE discord_id = $id;
-      `
-    , {
-      $id: discordId,
-    }).catch( (err) => {
-      log.error("DiscordStore", "Error deleting user token %s", err);
-      throw err;
-    });
-  }
-
-  public get_user_discord_ids(userId: string): Promise<string[]> {
-    log.silly("SQL", "get_user_discord_ids => %s", userId);
-    return this.db.allAsync(
-      `
-      SELECT discord_id
-      FROM user_id_discord_id
-      WHERE user_id = $userId;
-      `, {
-        $userId: userId,
-      },
-    ).then( (rows) => {
-      if (rows !== undefined) {
-        return rows.map((row) => row.discord_id);
-      } else {
-        return [];
-      }
-    }).catch( (err) => {
-      log.error("DiscordStore", "Error getting discord ids: %s", err.Error);
-      throw err;
-    });
-  }
-
-  public get_token(discordId: string): Promise<string> {
-    log.silly("SQL", "discord_id_token => %s", discordId);
-    return this.db.getAsync(
-      `
-      SELECT token
-      FROM discord_id_token
-      WHERE discord_id = $discordId
-      `, {
-        $discordId: discordId,
-      },
-    ).then( (row) => {
-      return row !== undefined ? row.token : null;
-    }).catch( (err) => {
-      log.error("DiscordStore", "Error getting discord ids  %s", err.Error);
-      throw err;
-    });
-  }
-
-  public get_dm_room(discordId, discordChannel): Promise<string> {
-    log.silly("SQL", "get_dm_room => %s", discordChannel); // Don't show discordId for privacy reasons
-    return this.db.getAsync(
-      `
-      SELECT room_id
-      FROM dm_rooms
-      WHERE dm_rooms.discord_id = $discordId
-      AND dm_rooms.discord_channel = $discordChannel;
-      `
-    , {
-      $discordId: discordId,
-      $discordChannel: discordChannel,
-    }).then( (row) => {
-      return row !== undefined ? row.room_id : null;
-    }).catch( (err) => {
-      log.error("DiscordStore", "Error getting room_id  %s", err.Error);
-      throw err;
-    });
-  }
-
-  public set_dm_room(discordId, discordChannel, roomId): Promise<null> {
-    log.silly("SQL", "set_dm_room => %s", discordChannel); // Don't show discordId for privacy reasons
-    return this.db.runAsync(
-      `
-      REPLACE INTO dm_rooms (discord_id,discord_channel,room_id)
-      VALUES ($discordId,$discordChannel,$roomId);
-      `
-    , {
-      $discordId: discordId,
-      $discordChannel: discordChannel,
-      $roomId: roomId,
-    }).catch( (err) => {
-      log.error("DiscordStore", "Error executing set_dm_room query  %s", err.Error);
-      throw err;
-    });
-  }
-
-  public get_all_user_discord_ids(): Promise<any> {
-    log.silly("SQL", "get_users_tokens");
-    return this.db.allAsync(
-      `
-      SELECT *
-      FROM get_user_discord_ids
-      `,
-    ).then( (rows) => {
-      return rows;
-    }).catch( (err) => {
-      log.error("DiscordStore", "Error getting user token  %s", err.Error);
-      throw err;
-    });
-  }
-
-  public Get<T extends IDbData>(dbType: {new(): T; }, params: any): Promise<T|null> {
-      const dType = new dbType();
-      log.silly("DiscordStore", `get <${dType.constructor.name} with params ${params}>`);
-      return dType.RunQuery(this, params).then(() => {
-          log.silly("DiscordStore", `Finished query with ${dType.Result ? "Results" : "No Results"}`);
-          return dType;
-      }).catch((ex) => {
-          log.warn("DiscordStore", `get <${dType.constructor.name} with params ${params} FAILED with exception ${ex}>`);
-          return null;
-      });
-  }
-
-  public Insert<T extends IDbData>(data: T): Promise<Error> {
-      log.silly("DiscordStore", `insert <${data.constructor.name}>`);
-      return data.Insert(this);
-  }
-
-  public Update<T extends IDbData>(data: T): Promise<Error>  {
-      log.silly("DiscordStore", `insert <${data.constructor.name}>`);
-      return data.Update(this);
-  }
-
-  public Delete<T extends IDbData>(data: T): Promise<Error>  {
-      log.silly("DiscordStore", `insert <${data.constructor.name}>`);
-      return data.Delete(this);
-  }
-
-  private getSchemaVersion ( ): Promise<number> {
-    log.silly("DiscordStore", "_get_schema_version");
-    return this.db.getAsync(`SELECT version FROM schema`).then((row) => {
-      return row === undefined ? 0 : row.version;
-    }).catch( ()  => {
-      return 0;
-    });
-  }
-
-  private setSchemaVersion (ver: number): Promise<any> {
-    log.silly("DiscordStore", "_set_schema_version => %s", ver);
-    return this.db.getAsync(
-      `
-      UPDATE schema
-      SET version = $ver
-      `, {$ver: ver},
-    );
-  }
-
-  private open_database(): Promise<null|Error> {
-    log.info("DiscordStore", "Opening SQLITE database %s", this.filepath);
-    return new Promise((resolve, reject) => {
-      this.db = new SQLite3.Database(this.filepath, (err) => {
-        if (err) {
-          log.error("DiscordStore", "Error opening database, %s");
-          reject(new Error("Couldn't open database. The appservice won't be able to continue."));
-          return;
+    public async addUserToken(userId: string, discordId: string, token: string): Promise<void> {
+        log.silly("SQL", "addUserToken => ", userId);
+        try {
+            await Promise.all([
+                this.db.Run(
+                  `
+                  INSERT INTO user_id_discord_id (discord_id,user_id) VALUES ($discordId,$userId);
+                  `
+                , {
+                    discordId,
+                    userId,
+                }),
+                this.db.Run(
+                  `
+                  INSERT INTO discord_id_token (discord_id,token) VALUES ($discordId,$token);
+                  `
+                , {
+                    discordId,
+                    token,
+                }),
+            ]);
+        } catch (err) {
+            log.error("Error storing user token ", err);
+            throw err;
         }
-        this.db = Bluebird.promisifyAll(this.db);
-        resolve();
-      });
-    });
-  }
+    }
+
+    public async deleteUserToken(mxid: string): Promise<void> {
+        const res = await this.db.Get("SELECT * from user_id_discord_id WHERE user_id = $id", {
+            id: mxid,
+        });
+        if (!res) {
+            return;
+        }
+        const discordId = res.discord_id;
+        log.silly("SQL", "deleteUserToken => ", discordId);
+        try {
+            await Promise.all([
+                this.db.Run(
+                    `
+                    DELETE FROM user_id_discord_id WHERE discord_id = $id
+                    `
+                , {
+                    id: discordId,
+                }),
+                this.db.Run(
+                    `
+                    DELETE FROM discord_id_token WHERE discord_id = $id
+                    `
+                , {
+                    id: discordId,
+                }),
+            ]);
+        } catch (err) {
+            log.error("Error deleting user token ", err);
+            throw err;
+        }
+    }
+
+    public async getUserDiscordIds(userId: string): Promise<string[]> {
+        log.silly("SQL", "getUserDiscordIds => ", userId);
+        try {
+            const rows = await this.db.All(
+                `
+                SELECT discord_id
+                FROM user_id_discord_id
+                WHERE user_id = $userId;
+                `
+            , {
+                userId,
+            });
+            if (rows != null) {
+                return rows.map((row) => row.discord_id as string);
+            } else {
+                return [];
+            }
+        } catch (err)  {
+            log.error("Error getting discord ids: ", err.Error);
+            throw err;
+        }
+    }
+
+    public async getToken(discordId: string): Promise<string> {
+        log.silly("SQL", "discord_id_token => ", discordId);
+        try {
+            const row = await this.db.Get(
+                `
+                SELECT token
+                FROM discord_id_token
+                WHERE discord_id = $discordId
+                `
+            , {
+                discordId,
+            });
+            return row ? row.token as string : "";
+        } catch (err) {
+            log.error("Error getting discord ids ", err.Error);
+            throw err;
+        }
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any callable-types
+    public async Get<T extends IDbData>(dbType: {new(): T; }, params: any): Promise<T|null> {
+        const dType = new dbType();
+        log.silly(`get <${dType.constructor.name} with params ${params}>`);
+        try {
+            await dType.RunQuery(this, params);
+            log.silly(`Finished query with ${dType.Result ? "Results" : "No Results"}`);
+            return dType;
+        } catch (ex) {
+            log.warn(`get <${dType.constructor.name} with params ${params} FAILED with exception ${ex}>`);
+            return null;
+        }
+    }
+
+    public async Insert<T extends IDbData>(data: T): Promise<void> {
+        log.silly(`insert <${data.constructor.name}>`);
+        await data.Insert(this);
+    }
+
+    public async Update<T extends IDbData>(data: T): Promise<void>  {
+        log.silly(`insert <${data.constructor.name}>`);
+        await data.Update(this);
+    }
+
+    public async Delete<T extends IDbData>(data: T): Promise<void>  {
+        log.silly(`insert <${data.constructor.name}>`);
+        await data.Delete(this);
+    }
+
+    public addRegisteredUser(userId: string) {
+        this.registeredUsers.add(userId);
+        this.db.Run("INSERT INTO registered_users VALUES ($userId)", {userId}).catch((err) => {
+            log.warn("Failed to insert registered user", err);
+        });
+    }
+    public isUserRegistered(userId: string): boolean {
+        return this.registeredUsers.has(userId);
+    }
+
+    public setTransactionCompleted(transactionId: string) {
+        this.asTxns.add(transactionId);
+        this.db.Run("INSERT INTO as_txns (txn_id) VALUES ($transactionId)", {transactionId}).catch((err) => {
+            log.warn("Failed to insert txn", err);
+        });
+    }
+    public isTransactionCompleted(transactionId: string): boolean {
+        return this.asTxns.has(transactionId);
+    }
+
+    public async getUserActivity(): Promise<UserActivitySet> {
+        const rows = await this.db.All('SELECT * FROM user_activity');
+        const users: {[mxid: string]: any} = {};
+        for (const row of rows) {
+            let data = row.data as any;
+            if (typeof data === 'string') { // sqlite has no first-class JSON
+                data = JSON.parse(data);
+            }
+            users[row.user_id as string] = data;
+        }
+        return { users };
+    }
+
+    public async storeUserActivity(userId: string, activity: UserActivity): Promise<void> {
+        return this.db.Run(
+            'INSERT INTO user_activity VALUES($id, $activity) ON CONFLICT (user_id) DO UPDATE SET data = $activity',
+            { id: userId, activity: JSON.stringify(activity) }
+        );
+    }
+
+    private async getSchemaVersion( ): Promise<number> {
+        log.silly("_get_schema_version");
+        let version = 0;
+        try {
+            const versionReply = await this.db.Get(`SELECT version FROM schema`);
+            version = versionReply!.version as number;
+        } catch (er) {
+            log.warn("Couldn't fetch schema version, defaulting to 0");
+        }
+        return version;
+    }
+
+    private async setSchemaVersion(ver: number): Promise<void> {
+        log.silly("_set_schema_version => ", ver);
+        await this.db.Run(
+            `
+            UPDATE schema
+            SET version = $ver
+            `, {ver},
+        );
+    }
+
+    private async openDatabase(): Promise<void|Error> {
+        if (this.config.filename) {
+            log.info("Filename present in config, using sqlite");
+            this.db = new SQLite3(this.config.filename);
+        } else if (this.config.connString) {
+            log.info("connString present in config, using postgres");
+            this.db = new Postgres(this.config.connString);
+        }
+        try {
+            this.db.Open();
+            this.pRoomStore = new DbRoomStore(this.db);
+            this.pUserStore = new DbUserStore(this.db);
+        } catch (ex) {
+            log.error("Error opening database:", ex);
+            throw new Error("Couldn't open database. The appservice won't be able to continue.");
+        }
+    }
 }
