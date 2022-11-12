@@ -101,6 +101,7 @@ export class DiscordBridgeConfigBridge {
     public disableInviteNotifications: boolean = false;
     public disableRoomNameNotifications: boolean = false;
     public disableRoomTopicNotifications: boolean = false;
+    public disableDiscordReplyPings: boolean = false;
     public determineCodeLanguage: boolean = false;
     public activityTracker: UserActivityTrackerConfig = UserActivityTrackerConfig.DEFAULT;
     public userLimit: number|null = null;
